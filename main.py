@@ -5,6 +5,16 @@ import h5py
 import matplotlib.pyplot as plt
 #step 4 library
 from scipy.signal import butter, filtfilt
+from scipy.stats import skew, kurtosis
+from sklearn.preprocessing import MinMaxScaler
+
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import pickle
+import json
 
 
 data_folder = "rawData"
@@ -248,141 +258,214 @@ for member, samples in member_plot_data.items():
     #plt.show()
 
 
-# Step 5 - Feature Extraction & Normalization
-# -----------------------------------------------------------------------
-
-from scipy.stats import kurtosis, skew
-from sklearn.preprocessing import StandardScaler
-
-WINDOW_SECONDS = 5    # Each segment is 5 seconds long
-SAMPLES_PER_SEC = 100 # Must match SAMPLE_RATE from Step 4
-SAMPLES_PER_WINDOW = WINDOW_SECONDS * SAMPLES_PER_SEC  # = 500 samples per window
-
-def extract_features(window_df):
-    """Extract 12 features per axis (Ax, Ay, Az) from a 5-second window.
-    Each axis gets its own set of features, giving 36 features total per window.
-    Features: mean, std, min, max, range, median, variance, RMS, skewness, kurtosis, energy, zero_crossings"""
-    features = []
-    for col in ["Ax", "Ay", "Az"]:
-        signal = window_df[col].values
-
-        mean        = np.mean(signal)
-        std         = np.std(signal)
-        minimum     = np.min(signal)
-        maximum     = np.max(signal)
-        sig_range   = maximum - minimum
-        median      = np.median(signal)
-        variance    = np.var(signal)
-        rms         = np.sqrt(np.mean(signal**2))           # Root Mean Square — good for activity intensity
-        skewness    = skew(signal)                           # Asymmetry of the signal distribution
-        kurt        = kurtosis(signal)                      # Peakedness of the signal distribution
-        energy      = np.sum(signal**2) / len(signal)       # Average signal energy per sample
-        # Zero crossings: counts how often the signal crosses zero — higher for jumping
-        zero_cross  = np.sum(np.diff(np.sign(signal - mean)) != 0)
-
-        features.extend([mean, std, minimum, maximum, sig_range,
-                          median, variance, rms, skewness, kurt, energy, zero_cross])
+# Step 5: Feature Extraction & Normalization 
+#Feature extraction function
+def extract_features(df):
+    """
+    Extract ≥10 features from Ax, Ay, Az, and Magnitude.
+    Returns a dictionary of features.
+    """
+    features = {}
+    axes = ["Ax", "Ay", "Az"]
+    df["Magnitude"] = np.sqrt(df["Ax"]**2 + df["Ay"]**2 + df["Az"]**2)
+    axes.append("Magnitude")
+    
+    for axis in axes:
+        col = df[axis]
+        features[f"{axis}_mean"] = col.mean()
+        features[f"{axis}_median"] = col.median()
+        features[f"{axis}_std"] = col.std()
+        features[f"{axis}_var"] = col.var()
+        features[f"{axis}_max"] = col.max()
+        features[f"{axis}_min"] = col.min()
+        features[f"{axis}_range"] = col.max() - col.min()
+        features[f"{axis}_rms"] = np.sqrt(np.mean(col**2))
+        features[f"{axis}_skew"] = skew(col)
+        features[f"{axis}_kurtosis"] = kurtosis(col)
     return features
 
-# Feature names for reference (12 features x 3 axes = 36 total)
-feature_names = [
-    f"{feat}_{axis}"
-    for axis in ["Ax", "Ay", "Az"]
-    for feat in ["mean", "std", "min", "max", "range", "median",
-                 "variance", "rms", "skewness", "kurtosis", "energy", "zero_crossings"]
-]
+#Normalization function
+def normalize_features(feature_dict, method="minmax"):
+    """
+    Normalize features using Min-Max scaling (default) or z-score.
+    """
+    keys = list(feature_dict.keys())
+    values = np.array([feature_dict[k] for k in keys]).reshape(-1, 1)
 
-all_features = []   # Will hold all feature vectors across all members and files
-all_labels   = []   # Corresponding label: "Walk" or "Jump"
+    if method == "minmax":
+        scaler = MinMaxScaler()
+        normalized = scaler.fit_transform(values).flatten()
+    elif method == "zscore":
+        normalized = (values - values.mean()) / values.std()
+        normalized = normalized.flatten()
+    else:
+        raise ValueError("Normalization method must be 'minmax' or 'zscore'")
 
-# Open HDF5 to read preprocessed data and write segmented data
-with h5py.File("project_data.h5", "a") as hdf5_file:
+    normalized_dict = {k: v for k, v in zip(keys, normalized)}
+    return normalized_dict
 
-    # Create the segmented group to store 5-second windows
-    if "segmented" in hdf5_file:
-        del hdf5_file["segmented"]
-    segmented_group = hdf5_file.create_group("segmented")
+#plot
+def plot_features(features, title, ax=None):
+    keys = list(features.keys())
+    values = [features[k] for k in keys]
+    
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(12, 5))
+    
+    ax.bar(range(len(values)), values, color="skyblue")
+    ax.set_xticks(range(len(values)))
+    ax.set_xticklabels(keys, rotation=45, ha="right", fontsize=8)
+    ax.set_ylabel("Normalized Value")
+    ax.set_title(title)
+    ax.grid(True)
 
-    preprocessed = hdf5_file["preprocessed"]
+for member, samples in member_plot_data.items():
+    print(f"\nFeature extraction & normalization for member: {member}")
+    
+    num_files = len(samples)
+    fig, axes = plt.subplots(num_files, 1, figsize=(14, 4*num_files))
+    
+    if num_files == 1:
+        axes = [axes]
 
+    for idx, (name, raw_df, final_df) in enumerate(samples):
+        # Extract features from 5-second preprocessed data
+        features = extract_features(final_df)
+        normalized_features = normalize_features(features, method="minmax")
+        
+        # Plot normalized features
+        plot_features(normalized_features, title=f"{member} | {name} | Normalized Features", ax=axes[idx])
+
+    plt.tight_layout()
+    plt.show()
+
+# Step 6 (FINAL - clean, no leakage, balanced)
+
+WINDOW_SECONDS = 5
+SAMPLE_RATE = 100
+SAMPLES_PER_WINDOW = WINDOW_SECONDS * SAMPLE_RATE
+
+def segment_data(df, label):
+    segments = []
+    num_windows = len(df) // SAMPLES_PER_WINDOW
+    
+    for i in range(num_windows):
+        start = i * SAMPLES_PER_WINDOW
+        end = start + SAMPLES_PER_WINDOW
+        segment = df.iloc[start:end]
+        segments.append((segment, label))
+    
+    return segments
+
+def get_label(filename):
+    filename = filename.lower()
+    if "walk" in filename:
+        return 0
+    elif "jump" in filename:
+        return 1
+    return None
+
+# -------------------------------
+# 1. Split FILES by class first
+# -------------------------------
+walk_files = []
+jump_files = []
+
+with h5py.File("project_data.h5", "r") as f:
+    preprocessed = f["preprocessed"]
+    
     for member in preprocessed.keys():
-        print(f"\nExtracting features for: {member}")
-        member_seg_group = segmented_group.create_group(member)
+        for name in preprocessed[member].keys():
+            label = get_label(name)
+            if label == 0:
+                walk_files.append((member, name))
+            elif label == 1:
+                jump_files.append((member, name))
 
-        for dataset_name in preprocessed[member].keys():
-            data = preprocessed[member][dataset_name][:]
-            df   = pd.DataFrame(data, columns=["Time", "Ax", "Ay", "Az"])
+# Shuffle
+np.random.shuffle(walk_files)
+np.random.shuffle(jump_files)
 
-            # Determine the label from the filename
-            # Expects filenames to contain "walk" or "jump" (case-insensitive)
-            name_lower = dataset_name.lower()
-            if "walk" in name_lower:
-                label = "Walk"
-            elif "jump" in name_lower:
-                label = "Jump"
-            else:
-                print(f"  Skipping {dataset_name} — could not determine label from filename")
-                continue
+# 90/10 split per class
+split_walk = int(0.9 * len(walk_files))
+split_jump = int(0.9 * len(jump_files))
 
-            # Segment the signal into non-overlapping 5-second windows
-            num_windows = len(df) // SAMPLES_PER_WINDOW
-            if num_windows == 0:
-                print(f"  Skipping {dataset_name} — not enough data for one 5s window")
-                continue
+train_files = walk_files[:split_walk] + jump_files[:split_jump]
+test_files  = walk_files[split_walk:] + jump_files[split_jump:]
 
-            print(f"  {dataset_name} ({label}): {num_windows} windows")
-            file_seg_group = member_seg_group.create_group(dataset_name)
+# -------------------------------
+# 2. Create segments
+# -------------------------------
+train_segments = []
+test_segments = []
 
-            for i in range(num_windows):
-                start = i * SAMPLES_PER_WINDOW
-                end   = start + SAMPLES_PER_WINDOW
-                window_df = df.iloc[start:end]
+with h5py.File("project_data.h5", "r") as f:
+    preprocessed = f["preprocessed"]
+    
+    # training data
+    for member, name in train_files:
+        data = preprocessed[member][name][:]
+        df = pd.DataFrame(data, columns=["Time", "Ax", "Ay", "Az"])
+        label = get_label(name)
+        train_segments.extend(segment_data(df, label))
+    
+    # testing data
+    for member, name in test_files:
+        data = preprocessed[member][name][:]
+        df = pd.DataFrame(data, columns=["Time", "Ax", "Ay", "Az"])
+        label = get_label(name)
+        test_segments.extend(segment_data(df, label))
 
-                # Save the raw window into the HDF5 segmented group
-                file_seg_group.create_dataset(f"window_{i}", data=window_df.values)
+print("Train segments:", len(train_segments))
+print("Test segments:", len(test_segments))
 
-                # Extract features from this window and store with its label
-                features = extract_features(window_df)
-                all_features.append(features)
-                all_labels.append(label)
+# -------------------------------
+# 3. Feature extraction
+# -------------------------------
+X_train, y_train = [], []
+X_test, y_test = [], []
 
-print(f"\nTotal windows extracted: {len(all_features)}")
-print(f"Label breakdown — Walk: {all_labels.count('Walk')} | Jump: {all_labels.count('Jump')}")
+for seg_df, label in train_segments:
+    X_train.append(list(extract_features(seg_df).values()))
+    y_train.append(label)
 
-# Convert to numpy arrays for normalization and model training
-X = np.array(all_features)   # Shape: (num_windows, 36)
-y = np.array(all_labels)      # Shape: (num_windows,)
+for seg_df, label in test_segments:
+    X_test.append(list(extract_features(seg_df).values()))
+    y_test.append(label)
 
-# --- Normalization: Z-score standardization ---
-# Ensures no single feature dominates due to scale differences
-# Fit the scaler on ALL data here — train/test split happens in Step 6
+X_train = np.array(X_train)
+X_test = np.array(X_test)
+y_train = np.array(y_train)
+y_test = np.array(y_test)
+
+# Check balance (IMPORTANT)
+print("\nTest set distribution:")
+print("Walking:", np.sum(y_test == 0))
+print("Jumping:", np.sum(y_test == 1))
+
+# -------------------------------
+# 4. Normalize
+# -------------------------------
 scaler = StandardScaler()
-X_normalized = scaler.fit_transform(X)
+X_train = scaler.fit_transform(X_train)
+X_test = scaler.transform(X_test)
 
-print(f"\nFeature matrix shape: {X_normalized.shape}")
-print(f"Features per window:  {X_normalized.shape[1]} ({len(['Ax','Ay','Az'])} axes x {X_normalized.shape[1]//3} features each)")
+# -------------------------------
+# 5. Train model
+# -------------------------------
+model = LogisticRegression(max_iter=1000)
+model.fit(X_train, y_train)
 
-# --- Visualization: Feature distributions per class ---
-# Plot the mean of each feature grouped by Walk vs Jump so we can see which features separate the classes
-walk_features = X_normalized[y == "Walk"]
-jump_features = X_normalized[y == "Jump"]
+# -------------------------------
+# 6. Evaluate
+# -------------------------------
+y_pred = model.predict(X_test)
 
-walk_means = np.mean(walk_features, axis=0)
-jump_means = np.mean(jump_features, axis=0)
+print("\nTest Accuracy:", accuracy_score(y_test, y_pred))
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred))
 
-fig, ax = plt.subplots(figsize=(18, 5))
-x_pos = np.arange(len(feature_names))
-width = 0.4
+cm = confusion_matrix(y_test, y_pred)
 
-ax.bar(x_pos - width/2, walk_means, width, label="Walk", color="steelblue",  alpha=0.8)
-ax.bar(x_pos + width/2, jump_means, width, label="Jump", color="darkorange", alpha=0.8)
-ax.set_xticks(x_pos)
-ax.set_xticklabels(feature_names, rotation=90, fontsize=7)
-ax.set_ylabel("Normalized Mean Value")
-ax.set_title("Step 5 - Mean Normalized Feature Values: Walk vs Jump")
-ax.legend()
-ax.grid(axis="y", linestyle="--", alpha=0.5)
-plt.tight_layout()
-plt.show()
-
-#step 6
+print("\nConfusion Matrix:")
+print(cm)
