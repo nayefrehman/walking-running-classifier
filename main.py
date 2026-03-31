@@ -339,22 +339,33 @@ for member, samples in member_plot_data.items():
     plt.tight_layout()
     plt.show()
 
-# Step 6 (FINAL - clean, no leakage, balanced)
+# Step 6 - Logistic Regression Classifier with Training Curves
+
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, log_loss
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import h5py
+import pickle
+import json
 
 WINDOW_SECONDS = 5
 SAMPLE_RATE = 100
 SAMPLES_PER_WINDOW = WINDOW_SECONDS * SAMPLE_RATE
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
 
 def segment_data(df, label):
     segments = []
     num_windows = len(df) // SAMPLES_PER_WINDOW
-    
+
     for i in range(num_windows):
         start = i * SAMPLES_PER_WINDOW
         end = start + SAMPLES_PER_WINDOW
-        segment = df.iloc[start:end]
+        segment = df.iloc[start:end].copy()
         segments.append((segment, label))
-    
+
     return segments
 
 def get_label(filename):
@@ -365,15 +376,15 @@ def get_label(filename):
         return 1
     return None
 
-# -------------------------------
-# 1. Split FILES by class first
-# -------------------------------
+# ---------------------------------------------------
+# 1. Split FILES by class first (prevents leakage)
+# ---------------------------------------------------
 walk_files = []
 jump_files = []
 
 with h5py.File("project_data.h5", "r") as f:
     preprocessed = f["preprocessed"]
-    
+
     for member in preprocessed.keys():
         for name in preprocessed[member].keys():
             label = get_label(name)
@@ -382,90 +393,256 @@ with h5py.File("project_data.h5", "r") as f:
             elif label == 1:
                 jump_files.append((member, name))
 
-# Shuffle
 np.random.shuffle(walk_files)
 np.random.shuffle(jump_files)
 
-# 90/10 split per class
-split_walk = int(0.9 * len(walk_files))
-split_jump = int(0.9 * len(jump_files))
+# 80% train, 10% validation, 10% test
+n_walk = len(walk_files)
+n_jump = len(jump_files)
 
-train_files = walk_files[:split_walk] + jump_files[:split_jump]
-test_files  = walk_files[split_walk:] + jump_files[split_jump:]
+train_walk_end = int(0.8 * n_walk)
+val_walk_end = int(0.9 * n_walk)
 
-# -------------------------------
-# 2. Create segments
-# -------------------------------
+train_jump_end = int(0.8 * n_jump)
+val_jump_end = int(0.9 * n_jump)
+
+train_files = walk_files[:train_walk_end] + jump_files[:train_jump_end]
+val_files   = walk_files[train_walk_end:val_walk_end] + jump_files[train_jump_end:val_jump_end]
+test_files  = walk_files[val_walk_end:] + jump_files[val_jump_end:]
+
+np.random.shuffle(train_files)
+np.random.shuffle(val_files)
+np.random.shuffle(test_files)
+
+print("Train files:", len(train_files))
+print("Validation files:", len(val_files))
+print("Test files:", len(test_files))
+
+# ---------------------------------------------------
+# 2. Convert files into 5-second segments
+# ---------------------------------------------------
 train_segments = []
+val_segments = []
 test_segments = []
 
 with h5py.File("project_data.h5", "r") as f:
     preprocessed = f["preprocessed"]
-    
-    # training data
+
     for member, name in train_files:
         data = preprocessed[member][name][:]
         df = pd.DataFrame(data, columns=["Time", "Ax", "Ay", "Az"])
         label = get_label(name)
         train_segments.extend(segment_data(df, label))
-    
-    # testing data
+
+    for member, name in val_files:
+        data = preprocessed[member][name][:]
+        df = pd.DataFrame(data, columns=["Time", "Ax", "Ay", "Az"])
+        label = get_label(name)
+        val_segments.extend(segment_data(df, label))
+
     for member, name in test_files:
         data = preprocessed[member][name][:]
         df = pd.DataFrame(data, columns=["Time", "Ax", "Ay", "Az"])
         label = get_label(name)
         test_segments.extend(segment_data(df, label))
 
-print("Train segments:", len(train_segments))
-print("Test segments:", len(test_segments))
+print("Train segments:", len(train_segments)) 
+print("Validation segments:", len(val_segments)) 
+print("Test segments:", len(test_segments)) 
 
-# -------------------------------
+np.random.shuffle(train_segments)
+np.random.shuffle(val_segments)
+np.random.shuffle(test_segments)
+
+
+# ---------------------------------------------------
+# SAVE SEGMENTED DATA TO HDF5 (REQUIRED)
+# ---------------------------------------------------
+with h5py.File("project_data.h5", "a") as f:
+    segmented_group = f.require_group("segmented")
+
+    train_group = segmented_group.require_group("train")
+    val_group = segmented_group.require_group("val")
+    test_group = segmented_group.require_group("test")
+
+    # Train
+    for i, (seg_df, label) in enumerate(train_segments):
+        dset = train_group.create_dataset(f"seg_{i}", data=seg_df.values)
+        dset.attrs["label"] = label
+
+    # Validation
+    for i, (seg_df, label) in enumerate(val_segments):
+        dset = val_group.create_dataset(f"seg_{i}", data=seg_df.values)
+        dset.attrs["label"] = label
+
+    # Test
+    for i, (seg_df, label) in enumerate(test_segments):
+        dset = test_group.create_dataset(f"seg_{i}", data=seg_df.values)
+        dset.attrs["label"] = label
+
+print("Segmented data saved to HDF5.")
+
+# ---------------------------------------------------
 # 3. Feature extraction
-# -------------------------------
+# ---------------------------------------------------
 X_train, y_train = [], []
+X_val, y_val = [], []
 X_test, y_test = [], []
 
+# Get consistent feature order from one sample
+sample_df, _ = train_segments[0]
+feature_names = list(extract_features(sample_df.copy()).keys())
+
+# Train set
 for seg_df, label in train_segments:
-    X_train.append(list(extract_features(seg_df).values()))
+    features = extract_features(seg_df.copy())
+    X_train.append([features[k] for k in feature_names])
     y_train.append(label)
 
+# Validation set
+for seg_df, label in val_segments:
+    features = extract_features(seg_df.copy())
+    X_val.append([features[k] for k in feature_names])
+    y_val.append(label)
+
+# Test set
 for seg_df, label in test_segments:
-    X_test.append(list(extract_features(seg_df).values()))
+    features = extract_features(seg_df.copy())
+    X_test.append([features[k] for k in feature_names])
     y_test.append(label)
 
 X_train = np.array(X_train)
+X_val = np.array(X_val)
 X_test = np.array(X_test)
+
 y_train = np.array(y_train)
+y_val = np.array(y_val)
 y_test = np.array(y_test)
 
-# Check balance (IMPORTANT)
-print("\nTest set distribution:")
-print("Walking:", np.sum(y_test == 0))
-print("Jumping:", np.sum(y_test == 1))
+print("\nClass distribution:")
+print("Train -> Walking:", np.sum(y_train == 0), "Jumping:", np.sum(y_train == 1))
+print("Val   -> Walking:", np.sum(y_val == 0), "Jumping:", np.sum(y_val == 1))
+print("Test  -> Walking:", np.sum(y_test == 0), "Jumping:", np.sum(y_test == 1))
 
-# -------------------------------
-# 4. Normalize
-# -------------------------------
+# ---------------------------------------------------
+# 4. Normalize using ONLY training data
+# ---------------------------------------------------
 scaler = StandardScaler()
 X_train = scaler.fit_transform(X_train)
+X_val = scaler.transform(X_val)
 X_test = scaler.transform(X_test)
 
-# -------------------------------
-# 5. Train model
-# -------------------------------
-model = LogisticRegression(max_iter=1000)
-model.fit(X_train, y_train)
+# ---------------------------------------------------
+# 5. Train logistic regression epoch-by-epoch
+# ---------------------------------------------------
+epochs = 12
+model = SGDClassifier(
+    loss="log_loss",      # logistic regression
+    max_iter=1,
+    tol=None,
+    random_state=RANDOM_SEED
+)
 
-# -------------------------------
-# 6. Evaluate
-# -------------------------------
-y_pred = model.predict(X_test)
+train_loss_history = []
+val_loss_history = []
+train_acc_history = []
+val_acc_history = []
 
-print("\nTest Accuracy:", accuracy_score(y_test, y_pred))
+classes = np.array([0, 1])
+
+for epoch in range(epochs):
+    # shuffle training data each epoch
+    indices = np.random.permutation(len(X_train))
+    X_train_epoch = X_train[indices]
+    y_train_epoch = y_train[indices]
+
+    if epoch == 0:
+        model.partial_fit(X_train_epoch, y_train_epoch, classes=classes)
+    else:
+        model.partial_fit(X_train_epoch, y_train_epoch)
+
+    # predicted probabilities for loss
+    train_probs = model.predict_proba(X_train)
+    val_probs = model.predict_proba(X_val)
+
+    # predicted labels for accuracy
+    y_train_pred = model.predict(X_train)
+    y_val_pred = model.predict(X_val)
+
+    train_loss = log_loss(y_train, train_probs)
+    val_loss = log_loss(y_val, val_probs)
+    train_acc = accuracy_score(y_train, y_train_pred)
+    val_acc = accuracy_score(y_val, y_val_pred)
+
+    train_loss_history.append(train_loss)
+    val_loss_history.append(val_loss)
+    train_acc_history.append(train_acc)
+    val_acc_history.append(val_acc)
+
+    print(
+        f"Epoch {epoch+1:02d}/{epochs} | "
+        f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
+        f"Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f}"
+    )
+
+# ---------------------------------------------------
+# 6. Final evaluation on test set
+# ---------------------------------------------------
+y_test_pred = model.predict(X_test)
+test_accuracy = accuracy_score(y_test, y_test_pred)
+cm = confusion_matrix(y_test, y_test_pred)
+
+print("\nFinal Test Accuracy:", test_accuracy)
 print("\nClassification Report:")
-print(classification_report(y_test, y_pred))
-
-cm = confusion_matrix(y_test, y_pred)
+print(classification_report(y_test, y_test_pred, target_names=["Walking", "Jumping"]))
 
 print("\nConfusion Matrix:")
 print(cm)
+
+# ---------------------------------------------------
+# 7. Plot training curves
+# ---------------------------------------------------
+epochs_range = range(1, epochs + 1)
+
+plt.figure(figsize=(10, 5))
+plt.plot(epochs_range, train_loss_history, label="Training Loss")
+plt.plot(epochs_range, val_loss_history, label="Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Log Loss")
+plt.title("Logistic Regression Training Curve - Loss")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(10, 5))
+plt.plot(epochs_range, train_acc_history, label="Training Accuracy")
+plt.plot(epochs_range, val_acc_history, label="Validation Accuracy")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.title("Logistic Regression Training Curve - Accuracy")
+plt.legend()
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+# ---------------------------------------------------
+# 8. Save results
+# ---------------------------------------------------
+with open("step6_results.json", "w") as f:
+    json.dump({
+        "test_accuracy": float(test_accuracy),
+        "train_loss_history": [float(x) for x in train_loss_history],
+        "val_loss_history": [float(x) for x in val_loss_history],
+        "train_acc_history": [float(x) for x in train_acc_history],
+        "val_acc_history": [float(x) for x in val_acc_history],
+        "confusion_matrix": cm.tolist()
+    }, f, indent=4)
+
+with open("step6_model.pkl", "wb") as f:
+    pickle.dump({
+        "model": model,
+        "scaler": scaler
+    }, f)
+
+print("\nStep 6 completed properly: model trained, training curves recorded, and test accuracy saved.")
